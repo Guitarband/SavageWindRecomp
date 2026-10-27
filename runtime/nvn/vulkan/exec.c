@@ -3520,7 +3520,7 @@ static bool up_patch_frag(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *
 // the matrix in c3[0-3], the view in c3[4-6], the pane's rectangle - width, height, left, top - in c3[33]):
 // - a layer whose matrix the game made without sead's projection classes (the menus' selection cursor) still projects
 //   16:9, and its pieces landed where the unwidened view puts them: it gets the widened matrix;
-// - a pane that covers the layer's whole 16:9 width (a fade, a loading screen's black, the menus' blurred picture of
+// - a pane as wide as the layer's 16:9 view (a fade, a loading screen's black, the menus' blurred picture of
 //   the game - a picture of the wider scene) covered only the middle of the wider picture: it gets the 16:9 matrix,
 //   which stretches it over the whole window. (The start screen is shown 16:9 with bars: output_scale.c.)
 // On a taller window (16:10, 4:3: shape < 1, #125) the same vertically: the layers' matrices get m11 x shape, and a
@@ -3538,6 +3538,18 @@ static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
     TexBackend *tb = (TexBackend *)st.rt.color[0]->backend;
     if (!tb || tb->rs_group != RS_OUT) return false;
     const float *g = (const float *)(uintptr_t)addr;
+    // ui2d text combines the projection and each label's position into this smaller, Y-flipped matrix.
+    // A cached 16:9 projection can survive a live resize; scale the whole X row so glyph widths and
+    // positions follow the widened HUD together.
+    if (shape > 1 && size == 128 && g[0] > 0 && g[5] < 0 && g[14] == -1 && g[15] > 0 &&
+        !g[1] && !g[2] && !g[4] && !g[6] && !g[8] && !g[9] && !g[12] && !g[13] &&
+        fabsf(-g[5] / g[0] - 16.0f / 9.0f) < 0.002f) {
+        float text_matrix[32];
+        memcpy(text_matrix, g, sizeof text_matrix);
+        for (int k = 0; k < 4; k++) text_matrix[k] /= shape;
+        *out = ubo_span(vk_transient_copy(text_matrix, sizeof text_matrix, 256), sizeof text_matrix);
+        return true;
+    }
     // A layer whose matrix comes with its view already in it (projection x view, a translation in column 3; the HUD's
     // clock and some texts): 16:9 (|m11| / m00), it gets its first row / shape (a taller window: its second x shape),
     // so it stays in the 16:9 layout with the rest of the HUD instead of moving outwards with the wider view.
@@ -3560,6 +3572,7 @@ static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
     if (!is_flat && !is_wide) return false;
     float m00 = is_flat && !tall ? g[0] / shape : g[0];  // the widened matrix's
     float m11 = is_flat && tall ? g[5] * shape : g[5];
+    float view_x_shift = 0;
     // a 40-degree HUD layer's pane over the whole 16:9 width (a taller window: height) -> the 16:9 matrix
     float m11_flat = tall ? m11 / shape : m11, edge = tall ? shape : 1 / shape;
     if (size >= 34 * 16 && fabsf(m11_flat - 2.74748f) < 0.001f) {
@@ -3576,18 +3589,29 @@ static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
                 if (n < lo) lo = n;
                 if (n > hi) hi = n;
             }
-            if (lo <= -edge + 0.01f && hi >= edge - 0.01f) {
+            // Full-width panes slide between pause pages. Keep their projection wide throughout the move.
+            if (lo < 1e8f && (tall ? lo <= -edge + 0.01f && hi >= edge - 0.01f
+                                    : hi - lo >= 2 / shape - 0.02f)) {
                 if (tall) m11 /= shape;
                 else m00 *= shape;
+            }
+            // Move both view transforms of each narrow frame end cap, preserving the inner line inset.
+            if (!tall && lo < 1e8f && rc[0] <= 128.1f && rc[1] >= 500 && fabsf(rc[2]) > 2000 &&
+                !mv[8] && !mv[9] && mv[11] < 0) {
+                float inner_edge = lo >= 0 ? lo : hi;
+                view_x_shift = (shape - 1) * inner_edge * -mv[11] / m00;
+                if (rc[0] <= 48.1f) view_x_shift += (shape - 1) * (rc[2] > 0 ? 35.0f : -35.0f);
             }
             if (lo < 1e8f && (hi <= -edge || lo >= edge)) hud_clip = true;  // (wholly off a 16:9 screen)
         }
     }
-    if (m00 == g[0] && m11 == g[5]) return false;
+    if (m00 == g[0] && m11 == g[5] && view_x_shift == 0) return false;
     static float buf[0x10000 / 4];
     uint64_t n = size > sizeof buf ? sizeof buf : size;
     memcpy(buf, g, n);
     buf[0] = m00, buf[5] = m11;
+    if (view_x_shift) buf[16 + 3] += view_x_shift;
+    if (view_x_shift) buf[20 * 4 + 3] += view_x_shift;  // keep the frame's paired view at the same edge
     *out = ubo_span(vk_transient_copy(buf, n, 256), n);
     return true;
 }
