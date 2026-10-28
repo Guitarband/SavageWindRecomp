@@ -1647,6 +1647,13 @@ static VkRect2D scissor_rect(void) {
     extern float output_view_shape(void);
     float shape = output_view_shape();
     if (shape > 1 && pass_out && pass_sx > 0 && sw < 16384) {
+        // The Inventory item list keeps its neighboring-page hint on a 16:9 screen. Its original
+        // left scissor starts before the hint; on a wide target that exposes the whole previous
+        // page's last item. Trim only that edge, leaving the next-page hint on the right alone.
+        if (x == 15 && y == 315 && sw == 1050 && sh == 600) {
+            sw -= 85 - x;
+            x = 85;
+        }
         double gw = w / pass_sx;  // (the target's own width)
         if (x > 0 || x + sw < gw - 0.5) {
             double c = gw / 2, x0 = c + (x - c) / shape, x1 = c + (x + sw - c) / shape;
@@ -3525,6 +3532,8 @@ static bool up_patch_frag(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *
 //   which stretches it over the whole window. (The start screen is shown 16:9 with bars: output_scale.c.)
 // On a taller window (16:10, 4:3: shape < 1, #125) the same vertically: the layers' matrices get m11 x shape, and a
 // pane over the whole 16:9 height gets the 16:9 matrix.
+// - the pause frame's narrow vertical ends get the same matrix as its long horizontal pieces, so their
+//   line, inset, and shadow all meet the corners when the frame spans a wider window.
 // In a copy of the buffer, as rt_persp makes them: m00 / shape on a wider window, m11 x shape on a narrower one.
 // - a pane wholly past the edges (a layout's parts kept off screen: a pane with a texture nothing draws into, at the
 //   inventory's description box) is not drawn (hud_clip, scissor_rect), as it is never seen on the console.
@@ -3572,7 +3581,6 @@ static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
     if (!is_flat && !is_wide) return false;
     float m00 = is_flat && !tall ? g[0] / shape : g[0];  // the widened matrix's
     float m11 = is_flat && tall ? g[5] * shape : g[5];
-    float view_x_shift = 0;
     // a 40-degree HUD layer's pane over the whole 16:9 width (a taller window: height) -> the 16:9 matrix
     float m11_flat = tall ? m11 / shape : m11, edge = tall ? shape : 1 / shape;
     if (size >= 34 * 16 && fabsf(m11_flat - 2.74748f) < 0.001f) {
@@ -3590,28 +3598,22 @@ static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
                 if (n > hi) hi = n;
             }
             // Full-width panes slide between pause pages. Keep their projection wide throughout the move.
+            // The frame's tall end caps share the X projection of its horizontal pieces.
+            bool frame_end = !tall && rc[0] <= 128.1f && rc[1] >= 500 && fabsf(rc[2]) > 2000 &&
+                             !mv[8] && !mv[9] && mv[11] < 0;
             if (lo < 1e8f && (tall ? lo <= -edge + 0.01f && hi >= edge - 0.01f
-                                    : hi - lo >= 2 / shape - 0.02f)) {
+                                    : hi - lo >= 2 / shape - 0.02f || frame_end)) {
                 if (tall) m11 /= shape;
                 else m00 *= shape;
-            }
-            // Move both view transforms of each narrow frame end cap, preserving the inner line inset.
-            if (!tall && lo < 1e8f && rc[0] <= 128.1f && rc[1] >= 500 && fabsf(rc[2]) > 2000 &&
-                !mv[8] && !mv[9] && mv[11] < 0) {
-                float inner_edge = lo >= 0 ? lo : hi;
-                view_x_shift = (shape - 1) * inner_edge * -mv[11] / m00;
-                if (rc[0] <= 48.1f) view_x_shift += (shape - 1) * (rc[2] > 0 ? 35.0f : -35.0f);
             }
             if (lo < 1e8f && (hi <= -edge || lo >= edge)) hud_clip = true;  // (wholly off a 16:9 screen)
         }
     }
-    if (m00 == g[0] && m11 == g[5] && view_x_shift == 0) return false;
+    if (m00 == g[0] && m11 == g[5]) return false;
     static float buf[0x10000 / 4];
     uint64_t n = size > sizeof buf ? sizeof buf : size;
     memcpy(buf, g, n);
     buf[0] = m00, buf[5] = m11;
-    if (view_x_shift) buf[16 + 3] += view_x_shift;
-    if (view_x_shift) buf[20 * 4 + 3] += view_x_shift;  // keep the frame's paired view at the same edge
     *out = ubo_span(vk_transient_copy(buf, n, 256), n);
     return true;
 }
