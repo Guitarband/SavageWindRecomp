@@ -5930,7 +5930,24 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &srcimg, &small_mem, NULL));
         vk_image_init_layout(cb, srcimg, VK_IMAGE_ASPECT_COLOR_BIT);
-        VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)b->width, (int32_t)b->height, 1}},
+        int32_t sx0 = 0, sy0 = 0, sx1 = (int32_t)b->width, sy1 = (int32_t)b->height;
+        if (b->scalable && rg[0] == 0 && rg[1] == 0 && rg[3] == (int32_t)t->width && rg[4] == (int32_t)t->height) {
+            // A wide render target keeps its guest dimensions (for example the save caption's 256x144) but its
+            // backing image includes the extra sides. Crop those sides before returning it to the guest; scaling the
+            // whole backing to the guest's fixed 16:9 size squeezes the save screenshot horizontally.
+            double guest_aspect = (double)t->width / t->height;
+            double backing_aspect = (double)b->width / b->height;
+            if (backing_aspect > guest_aspect) {
+                sx1 = (int32_t)lround(b->height * guest_aspect);
+                sx0 = ((int32_t)b->width - sx1) / 2;
+                sx1 += sx0;
+            } else if (backing_aspect < guest_aspect) {
+                sy1 = (int32_t)lround(b->width / guest_aspect);
+                sy0 = ((int32_t)b->height - sy1) / 2;
+                sy1 += sy0;
+            }
+        }
+        VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{sx0, sy0, 0}, {sx1, sy1, 1}},
                           .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)t->width, (int32_t)t->height, 1}}};
         vkCmdBlitImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, srcimg, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
         vk_full_barrier(cb);
