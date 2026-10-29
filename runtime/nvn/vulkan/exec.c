@@ -23,6 +23,8 @@
 #include "../output_scale.h"
 #include "framegen.h"
 #include "../../game_sites.h"
+#include "../../framepace.h"
+#include "../../services/fs_layout.h"
 
 static uint64_t stat_build_waits;  // draws that waited for their pipeline (draw_must_happen)
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
@@ -1647,12 +1649,21 @@ static VkRect2D scissor_rect(void) {
     extern float output_view_shape(void);
     float shape = output_view_shape();
     if (shape > 1 && pass_out && pass_sx > 0 && sw < 16384) {
-        // The Inventory item list keeps its neighboring-page hint on a 16:9 screen. Its original
-        // left scissor starts before the hint; on a wide target that exposes the whole previous
-        // page's last item. Trim only that edge, leaving the next-page hint on the right alone.
-        if (x == 15 && y == 315 && sw == 1050 && sh == 600) {
-            sw -= 85 - x;
-            x = 85;
+        FsInventoryClipLayout list;
+        if (framepace_menu_ui() && st.rt.color[0] && fs_inventory_clip_layout(&list)) {
+            double sx = (double)st.rt.color[0]->width / list.root_w;
+            double sy = (double)st.rt.color[0]->height / list.root_h;
+            int cx = (int)lround(list.clip_x * sx), cy = (int)lround(list.clip_y * sy);
+            int cw = (int)lround(list.clip_w * sx), ch = (int)lround(list.clip_h * sy);
+            if (abs(x - cx) <= 1 && abs(y - cy) <= 1 && abs(sw - cw) <= 1 && abs(sh - ch) <= 1) {
+                // N_Cut_00 and item centers are in layout space; NVN's scissor is in guest target pixels.
+                // Clip at the previous page's last item center; the next-page hint keeps its original right edge.
+                int item = (int)lround(list.previous_item_x * sx), right = x + sw;
+                if (item > x && item < right) {
+                    x = item;
+                    sw = right - x;
+                }
+            }
         }
         double gw = w / pass_sx;  // (the target's own width)
         if (x > 0 || x + sw < gw - 0.5) {
@@ -3532,12 +3543,39 @@ static bool up_patch_frag(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *
 //   which stretches it over the whole window. (The start screen is shown 16:9 with bars: output_scale.c.)
 // On a taller window (16:10, 4:3: shape < 1, #125) the same vertically: the layers' matrices get m11 x shape, and a
 // pane over the whole 16:9 height gets the 16:9 matrix.
-// - the pause frame's narrow vertical ends get the same matrix as its long horizontal pieces, so their
+// - a pause frame's vertical ends get the same matrix as the horizontal pieces they meet, so their
 //   line, inset, and shadow all meet the corners when the frame spans a wider window.
 // In a copy of the buffer, as rt_persp makes them: m00 / shape on a wider window, m11 x shape on a narrower one.
 // - a pane wholly past the edges (a layout's parts kept off screen: a pane with a texture nothing draws into, at the
 //   inventory's description box) is not drawn (hud_clip, scissor_rect), as it is never seen on the console.
 // SAVAGEWIND_NO_HUD_FIX=1: off.
+static bool hud_frame_end(const float *g, const float *mv, const float *rc, float m00, float shape) {
+    if (!framepace_menu_ui() || mv[8] || mv[9] || mv[11] >= 0) return false;
+    // ui2d's window block has four border margins at c3[26] and its parent window size at c3[27].
+    // The piece rectangle at c3[33] is local to that window: a right end touches the top/right
+    // parent corners; a left end touches the bottom/left corners. The long horizontal pieces use
+    // the same view and parent bounds. Match those relationships, rather than one layout's pixels.
+    float w = g[108], h = g[109], ew = rc[0], eh = rc[1];
+    if (!isfinite(w) || !isfinite(h) || w <= 0 || h <= 0 || ew <= 0 || ew >= w || eh <= ew || eh >= h) return false;
+    float tol = 8 * FLT_EPSILON * fmaxf(1.0f, fmaxf(w, h));
+    bool width_margin = false, height_margin = false;
+    for (int k = 104; k < 108; k++) {
+        width_margin |= isfinite(g[k]) && fabsf(ew - g[k]) <= tol;
+        height_margin |= isfinite(g[k]) && fabsf(h - eh - g[k]) <= tol;
+    }
+    if (!width_margin || !height_margin) return false;
+    bool right = fabsf(rc[2] + ew - w * 0.5f) <= tol && fabsf(rc[3] - h * 0.5f) <= tol;
+    bool left = fabsf(rc[2] + w * 0.5f) <= tol && fabsf(rc[3] - eh + h * 0.5f) <= tol;
+    // Project the adjacent top or bottom piece, whose size is (window - this end's margins).
+    // It must pass the same full-width test as the real horizontal draw; small windows stay untouched.
+    float span = (fabsf(mv[0]) * (w - ew) + fabsf(mv[1]) * (h - eh)) * m00 / -mv[11];
+    bool end = (right || left) && span >= 2 / shape - 0.02f;
+    if (end && g_debug_frame)
+        LOG("[hud-frame] end %.3f %.3f %.3f %.3f from window %.3fx%.3f (span %.3f)\n",
+            ew, eh, rc[2], rc[3], w, h, span);
+    return end;
+}
+
 static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_NO_HUD_FIX") != NULL;
@@ -3598,9 +3636,7 @@ static bool hud_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out)
                 if (n > hi) hi = n;
             }
             // Full-width panes slide between pause pages. Keep their projection wide throughout the move.
-            // The frame's tall end caps share the X projection of its horizontal pieces.
-            bool frame_end = !tall && rc[0] <= 128.1f && rc[1] >= 500 && fabsf(rc[2]) > 2000 &&
-                             !mv[8] && !mv[9] && mv[11] < 0;
+            bool frame_end = !tall && hud_frame_end(g, mv, rc, m00, shape);
             if (lo < 1e8f && (tall ? lo <= -edge + 0.01f && hi >= edge - 0.01f
                                     : hi - lo >= 2 / shape - 0.02f || frame_end)) {
                 if (tall) m11 /= shape;
