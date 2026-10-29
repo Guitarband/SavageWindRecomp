@@ -5466,6 +5466,38 @@ have_pipe:
             vp_oy = (ph - st.rt.color[0]->height * u) * 0.5f;
         }
     }
+    // A full-screen draw into a smaller, fixed-size capture (854x480 before the save's
+    // 256x144 thumbnail) samples the reshaped final image. Expand its viewport about the
+    // center so the target clips a guest-aspect crop, rather than squeezing the whole image.
+    // Scaled blur targets and partial draws keep their normal viewport.
+    if (st.rt.ncolor == 1 && st.rt.color[0] && pr->fi->ntex == 1 && r->x[2] <= 6 &&
+        vp[0] == 0 && vp[1] == 0 && vp[2] == st.rt.color[0]->width && vp[3] == st.rt.color[0]->height) {
+        NvnTexture *dst = st.rt.color[0], *src = shader_texture_object(1, &pr->fi->tex[0]);
+        TexBackend *d = dst->backend, *s = src ? src->backend : NULL;
+        if (d && !d->scalable && pass_w == d->width && pass_h == d->height &&
+            s && s->rs_group == RS_OUT && src->target == 1 && dst->target == 1 &&
+            src->levels == 1 && s->samples == 1 && d->samples == 1 &&
+            d->aspect == VK_IMAGE_ASPECT_COLOR_BIT && s->aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
+            dst->width < src->width && dst->height < src->height &&
+            fabs((double)dst->width - (double)dst->height * src->width / src->height) <= 1 &&
+            st.scissor[0][0] <= 0 && st.scissor[0][1] <= 0 &&
+            (int64_t)st.scissor[0][0] + st.scissor[0][2] >= dst->width &&
+            (int64_t)st.scissor[0][1] + st.scissor[0][3] >= dst->height) {
+            float shape = (float)((double)s->width * src->height / ((double)s->height * src->width));
+            float sx = vp_sx * fmaxf(shape, 1), sy = vp_sy / fminf(shape, 1);
+            float w = dst->width * sx, h = dst->height * sy, x = (pass_w - w) * 0.5f, y = (pass_h - h) * 0.5f;
+            const VkPhysicalDeviceLimits *lim = &g_vk.props.limits;
+            if (isfinite(w) && isfinite(h) && w > 0 && h > 0 &&
+                w <= lim->maxViewportDimensions[0] && h <= lim->maxViewportDimensions[1] &&
+                x >= lim->viewportBoundsRange[0] && y >= lim->viewportBoundsRange[0] &&
+                x + w <= lim->viewportBoundsRange[1] && y + h <= lim->viewportBoundsRange[1]) {
+                vp_sx = sx; vp_sy = sy; vp_ox = x; vp_oy = y;
+                if (getenv("SAVAGEWIND_LOG_COPIES"))
+                    LOG("[copy] fixed-aspect capture %ux%u backing %ux%u -> %ux%u: viewport %.3fx%.3f at %.3f,%.3f\n",
+                        src->width, src->height, s->width, s->height, dst->width, dst->height, w, h, x, y);
+            }
+        }
+    }
     {
         float k = 1.0f;  // (horizontal stretch of a camera-attached effect: none, the view keeps its 16:9 shape)
         float vx = vp[0] * vp_sx + vp_ox, vw = vp[2] * vp_sx;
