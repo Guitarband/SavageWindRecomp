@@ -5466,10 +5466,11 @@ have_pipe:
             vp_oy = (ph - st.rt.color[0]->height * u) * 0.5f;
         }
     }
-    // A full-screen draw into a smaller, fixed-size capture (854x480 before the save's
-    // 256x144 thumbnail) samples the reshaped final image. Expand its viewport about the
-    // center so the target clips a guest-aspect crop, rather than squeezing the whole image.
-    // Scaled blur targets and partial draws keep their normal viewport.
+    // A full-screen draw into a smaller, fixed-size capture samples the reshaped final image.
+    // Derive the crop from the source's guest/backing dimensions, never a window or thumbnail size.
+    // Expand the viewport about its center so the target clips the original guest aspect.
+    // The vertex-count guard admits simple full-screen triangles/quads; other capture meshes need
+    // coverage information before opting in. Scaled blur targets and partial draws stay untouched.
     if (st.rt.ncolor == 1 && st.rt.color[0] && pr->fi->ntex == 1 && r->x[2] <= 6 &&
         vp[0] == 0 && vp[1] == 0 && vp[2] == st.rt.color[0]->width && vp[3] == st.rt.color[0]->height) {
         NvnTexture *dst = st.rt.color[0], *src = shader_texture_object(1, &pr->fi->tex[0]);
@@ -5479,6 +5480,7 @@ have_pipe:
             src->levels == 1 && s->samples == 1 && d->samples == 1 &&
             d->aspect == VK_IMAGE_ASPECT_COLOR_BIT && s->aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
             dst->width < src->width && dst->height < src->height &&
+            // A whole-pixel target can round the source aspect by up to one destination pixel.
             fabs((double)dst->width - (double)dst->height * src->width / src->height) <= 1 &&
             st.scissor[0][0] <= 0 && st.scissor[0][1] <= 0 &&
             (int64_t)st.scissor[0][0] + st.scissor[0][2] >= dst->width &&
